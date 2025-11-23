@@ -16,6 +16,8 @@ The function can also be imported and called from other modules.
 
 from __future__ import annotations
 import sys
+import os
+import argparse
 from typing import Optional
 
 
@@ -249,6 +251,13 @@ def alert_on_detections(df):
 
     At the end, prints a summary with total alerts.
     """
+    """
+    Print alerts for rows where `detected_anomaly` or `ml_detected` is True and
+    summarize total alerts.
+
+    This function is defensive: it creates missing columns if they are absent
+    and formats timestamps. Alerts are printed to stdout.
+    """
     # Defensive: ensure columns exist
     df = df.copy()
     if 'detected_anomaly' not in df.columns:
@@ -262,6 +271,12 @@ def alert_on_detections(df):
 
     total_alerts = 0
 
+    # local import to avoid top-level dependency when not needed
+    try:
+        import pandas as pd
+    except Exception:
+        pd = None
+
     for _, row in df.iterrows():
         types = []
         if row['detected_anomaly']:
@@ -274,7 +289,10 @@ def alert_on_detections(df):
             ts = row.get('timestamp', '')
             # Format timestamp if it's a Timestamp
             try:
-                ts_str = pd.to_datetime(ts).isoformat()
+                if pd is not None:
+                    ts_str = pd.to_datetime(ts).isoformat()
+                else:
+                    ts_str = str(ts)
             except Exception:
                 ts_str = str(ts)
             typ = '+'.join(types)
@@ -285,20 +303,62 @@ def alert_on_detections(df):
 
 
 if __name__ == '__main__':
-    # Run parser and then detection + ML-based detection
-    df = parse_network_logs()
-    if df is None:
-        sys.exit(1)
-    df = detect_anomalies(df)
-    # Run ML-based detection (Isolation Forest)
-    try:
-        df = ml_isolation_forest(df)
-    except Exception as e:
-        print(f"ML detection failed: {e}")
-    # Raise alerts for detections
-    try:
-        alert_on_detections(df)
-    except Exception as e:
-        print(f"Alerting failed: {e}")
-    # Exit successfully
-    sys.exit(0)
+    def main(argv=None):
+        """
+        Main orchestration function.
+
+        Steps performed:
+        1. If `network_logs.csv` does not exist, simulate packets using
+           `ids_simulator` with `--num_packets` and save to file.
+        2. Parse the logs via `parse_network_logs`.
+        3. Run detections according to `mode` ("rule", "ml", or "both").
+        4. Trigger alerts via `alert_on_detections`.
+
+        Returns an exit code (0 success, non-zero failure).
+        """
+
+        parser = argparse.ArgumentParser(description='Parse logs and run detections')
+        parser.add_argument('--num_packets', type=int, default=100, help='Number of packets to simulate if no log exists')
+        parser.add_argument('--mode', choices=['rule', 'ml', 'both'], default='both', help='Detection mode to run')
+        args = parser.parse_args(argv)
+
+        # If logs missing, try to simulate
+        logfile = 'network_logs.csv'
+        if not os.path.exists(logfile):
+            print(f"Log file '{logfile}' not found — simulating {args.num_packets} packets...")
+            try:
+                import ids_simulator
+                packets = ids_simulator.generate_packets(args.num_packets, 0.8)
+                ids_simulator.save_packets_to_csv(packets, logfile)
+                print(f"Saved simulated logs to '{logfile}'")
+            except Exception as e:
+                print(f"Failed to simulate packets: {e}")
+                return 2
+
+        # Parse logs
+        df = parse_network_logs(logfile)
+        if df is None:
+            print("Failed to parse logs")
+            return 3
+
+        # Run detections based on mode
+        if args.mode in ('rule', 'both'):
+            df = detect_anomalies(df)
+        if args.mode in ('ml', 'both'):
+            try:
+                df = ml_isolation_forest(df)
+            except Exception as e:
+                print(f"ML detection failed: {e}")
+
+        # Trigger alerts
+        try:
+            alert_on_detections(df)
+        except Exception as e:
+            print(f"Alerting failed: {e}")
+            return 4
+
+        return 0
+
+    # Execute main with command-line args
+    exit_code = main()
+    sys.exit(exit_code)
