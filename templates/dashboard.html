@@ -16,8 +16,27 @@
   </head>
   <body>
     <h1>IDS Dashboard - Recent Alerts</h1>
-    {% if alerts and alerts|length > 0 %}
-      <table>
+    <div>
+      <label for="filter-type">Type:</label>
+      <select id="filter-type">
+        <option value="all">All</option>
+        <option value="rule">Rule</option>
+        <option value="ML">ML</option>
+        <option value="rule+ML">Both</option>
+      </select>
+
+      <label for="filter-src">Source IP:</label>
+      <input id="filter-src" placeholder="e.g. 192.168.1.1" />
+
+      <button id="refresh">Refresh</button>
+    </div>
+
+    <div style="margin-top:16px;">
+      <img id="anomalies-img" src="/anomalies.png" alt="Anomalies chart" style="max-width:100%;height:auto;border:1px solid #ccc;padding:4px;">
+    </div>
+
+    <div style="margin-top:16px;">
+      <table id="alerts-table">
         <thead>
           <tr>
             <th>Timestamp</th>
@@ -30,21 +49,103 @@
           </tr>
         </thead>
         <tbody>
-          {% for a in alerts %}
-          <tr>
-            <td>{{ a.timestamp }}</td>
-            <td>{{ a.src_ip }}</td>
-            <td>{{ a.type }}</td>
-            <td>{{ a.protocol }}</td>
-            <td>{{ a.port }}</td>
-            <td>{{ a.payload_size }}</td>
-            <td>{{ a.is_malicious }}</td>
-          </tr>
-          {% endfor %}
         </tbody>
       </table>
-    {% else %}
-      <p>No alerts to show.</p>
-    {% endif %}
+    </div>
+
+    <div style="margin-top:16px;">
+      <button id="gen-plot">Generate Plot</button>
+    </div>
+
+    <div style="margin-top:12px;">
+      <img id="anomalies-img-bottom" src="/static/anomalies.png" alt="Anomaly Plot" style="width:100%; border:1px solid #ccc; padding:4px;">
+    </div>
+
+    <script>
+      const tableBody = document.querySelector('#alerts-table tbody');
+      const filterType = document.getElementById('filter-type');
+      const filterSrc = document.getElementById('filter-src');
+      const refreshBtn = document.getElementById('refresh');
+      const anomaliesImg = document.getElementById('anomalies-img');
+
+      async function fetchAlerts(){
+        try{
+          const res = await fetch('/alerts');
+          const alerts = await res.json();
+          return alerts;
+        } catch(e){
+          console.error('Failed to fetch alerts', e);
+          return [];
+        }
+      }
+
+      function renderAlerts(alerts){
+        tableBody.innerHTML = '';
+        const typeVal = filterType.value;
+        const srcVal = filterSrc.value.trim();
+
+        const filtered = alerts.filter(a => {
+          if(typeVal !== 'all' && a.type !== typeVal) return false;
+          if(srcVal && !a.src_ip.includes(srcVal)) return false;
+          return true;
+        });
+
+        for(const a of filtered){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${a.timestamp}</td>
+            <td>${a.src_ip}</td>
+            <td>${a.type}</td>
+            <td>${a.protocol}</td>
+            <td>${a.port}</td>
+            <td>${a.payload_size}</td>
+            <td>${a.is_malicious}</td>
+          `;
+          tableBody.appendChild(tr);
+        }
+      }
+
+      async function refreshAll(){
+        const alerts = await fetchAlerts();
+        renderAlerts(alerts);
+        // Reload the anomalies image (cache-bust)
+        anomaliesImg.src = '/anomalies.png?_=' + Date.now();
+      }
+
+      refreshBtn.addEventListener('click', refreshAll);
+
+      // Auto-refresh every 10s
+      setInterval(refreshAll, 10000);
+
+      // Initial load
+      refreshAll();
+
+      // Generate plot button handling
+      const genBtn = document.getElementById('gen-plot');
+      const anomaliesImgBottom = document.getElementById('anomalies-img-bottom');
+      if(genBtn){
+        genBtn.addEventListener('click', async () => {
+          genBtn.disabled = true;
+          const oldText = genBtn.textContent;
+          genBtn.textContent = 'Generating...';
+          try{
+            const res = await fetch('/generate-plot');
+            if(res.ok){
+              // Refresh both images (top + bottom)
+              anomaliesImg.src = '/static/anomalies.png?_=' + Date.now();
+              if(anomaliesImgBottom) anomaliesImgBottom.src = '/static/anomalies.png?_=' + Date.now();
+            } else {
+              const txt = await res.text();
+              alert('Plot generation failed: ' + txt);
+            }
+          } catch(e){
+            alert('Plot generation error: ' + e);
+          } finally {
+            genBtn.disabled = false;
+            genBtn.textContent = oldText;
+          }
+        });
+      }
+    </script>
   </body>
 </html>

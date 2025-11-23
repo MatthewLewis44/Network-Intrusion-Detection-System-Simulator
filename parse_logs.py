@@ -109,15 +109,15 @@ def _main():
         sys.exit(1)
 
 
-def detect_anomalies(df):
+def detect_anomalies(df, payload_threshold: int = 1000, port_threshold: int = 1024, rate_threshold: int = 50):
     """
     Apply simple rule-based detection to the parsed DataFrame and add a
     boolean column `detected_anomaly`.
 
     Rules (mark as anomaly if any are true):
-    - payload_size > 1000
-    - port < 1024 and protocol != 'TCP'
-    - packet rate (packets_per_minute) > 50
+    - payload_size > payload_threshold
+    - port < port_threshold and protocol != 'TCP'
+    - packet rate (packets_per_minute) > rate_threshold
 
     The function prints the total anomalies detected and returns the
     DataFrame with the new column.
@@ -136,9 +136,9 @@ def detect_anomalies(df):
     df['protocol'] = df.get('protocol', '').astype(str).str.upper()
     df['packets_per_minute'] = pd.to_numeric(df.get('packets_per_minute', 0), errors='coerce').fillna(0)
 
-    cond_payload = df['payload_size'] > 1000
-    cond_port_protocol = (df['port'] < 1024) & (df['protocol'] != 'TCP')
-    cond_rate = df['packets_per_minute'] > 50
+    cond_payload = df['payload_size'] > payload_threshold
+    cond_port_protocol = (df['port'] < port_threshold) & (df['protocol'] != 'TCP')
+    cond_rate = df['packets_per_minute'] > rate_threshold
 
     df['detected_anomaly'] = (cond_payload | cond_port_protocol | cond_rate).astype(bool)
 
@@ -157,14 +157,14 @@ def detect_anomalies(df):
     return df
 
 
-def ml_isolation_forest(df, features=None, test_size=0.3, random_state=42):
+def ml_isolation_forest(df, features=None, test_size=0.3, random_state=42, contamination='auto'):
     """
     Use Isolation Forest to detect anomalies using the specified features.
 
     - features: list of feature column names to use. If None, defaults to
       ['payload_size', 'port', 'packet_rate'] where 'packet_rate' is
       taken from 'packets_per_minute' if present.
-    - Splits data with `train_test_split`, fits IsolationForest on the
+        - Splits data with `train_test_split`, fits IsolationForest on the
       training set, predicts on the test set, computes accuracy against
       `is_malicious`, and adds a boolean column `ml_detected` to the
       returned DataFrame with predictions for the full dataset.
@@ -216,7 +216,8 @@ def ml_isolation_forest(df, features=None, test_size=0.3, random_state=42):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
 
     # Fit Isolation Forest
-    model = IsolationForest(random_state=random_state, contamination='auto')
+    # allow user-specified contamination (float) or 'auto'
+    model = IsolationForest(random_state=random_state, contamination=contamination)
     model.fit(X_train)
 
     # Predict on test set (-1 anomaly, 1 normal)
@@ -267,38 +268,102 @@ def plot_anomalies(df, outpath: str = 'anomalies.png') -> str:
     except Exception as e:
         raise RuntimeError('matplotlib is required to generate plots: ' + str(e))
 
+    import os
+    import tempfile
+
     df = df.copy()
+
     # Ensure detection columns exist
     if 'detected_anomaly' not in df.columns:
         df['detected_anomaly'] = False
     if 'ml_detected' not in df.columns:
         df['ml_detected'] = False
 
-    # Ensure minute column exists
+    # Ensure timestamp/minute column exists
     if 'minute' not in df.columns:
-        try:
-            df['minute'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.floor('min')
-        except Exception:
+        if 'timestamp' in df.columns:
+            try:
+                df['minute'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.floor('min')
+            except Exception:
+                df['minute'] = pd.NaT
+        else:
+            # no timestamp available: create a single bucket
             df['minute'] = pd.NaT
 
-    # Compute counts per minute
-    df['is_alert'] = df['detected_anomaly'] | df['ml_detected']
-    counts = df.groupby('minute')['is_alert'].sum().fillna(0)
+    # Create an 'is_alert' boolean
+    df['is_alert'] = (df.get('detected_anomaly', False)) | (df.get('ml_detected', False))
 
-    # If counts is empty or all zeros, still create a minimal plot
+    # Group by minute and count alerts
+    try:
+        counts = df.groupby('minute')['is_alert'].sum().fillna(0)
+    except Exception:
+        counts = pd.Series(dtype='int')
+
+    # Prepare the figure
     fig, ax = plt.subplots(figsize=(10, 4))
-    if counts.empty:
-        ax.text(0.5, 0.5, 'No alerts', ha='center', va='center')
-    else:
-        counts.plot(kind='bar', ax=ax, color='tab:red')
-        ax.set_xlabel('Minute')
-        ax.set_ylabel('Anomaly Count')
-        ax.set_title('Anomaly Counts per Minute')
-        plt.xticks(rotation=45, ha='right')
+
+    try:
+        if counts.empty or int(counts.sum()) == 0:
+            # No anomalies: plot a flat line (zero) or a single point and annotate
+            if counts.empty:
+                # create a single dummy point
+                xs = [0]
+                ys = [0]
+                labels = ['now']
+            else:
+                xs = range(len(counts))
+                ys = [0] * len(counts)
+                labels = [str(x) for x in counts.index]
+
+            ax.plot(xs, ys, marker='o', color='tab:gray')
+            ax.set_xlabel('Time')
+            ax.set_ylabel('Anomaly Count')
+            ax.set_title('Anomaly Counts Over Time')
+            ax.text(0.5, 0.8, 'No anomalies detected', transform=ax.transAxes, ha='center', va='center', fontsize=12, color='green')
+            if labels:
+                try:
+                    ax.set_xticks(xs)
+                    ax.set_xticklabels(labels, rotation=45, ha='right')
+                except Exception:
+                    pass
+        else:
+            # Plot counts over time
+            # ensure index labels are printable
+            labels = [str(x) for x in counts.index]
+            xs = range(len(counts))
+            ys = counts.values.tolist()
+            ax.plot(xs, ys, marker='o', color='tab:red')
+            ax.set_xlabel('Minute')
+            ax.set_ylabel('Anomaly Count')
+            ax.set_title('Anomaly Counts Over Time')
+            ax.set_xticks(xs)
+            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.grid(axis='y', linestyle='--', alpha=0.5)
+
         plt.tight_layout()
 
-    plt.savefig(outpath, dpi=150)
-    plt.close(fig)
+        # Save to a temporary file first, then atomically rename
+        dirn = os.path.dirname(os.path.abspath(outpath)) or '.'
+        fd, tmp_path = tempfile.mkstemp(suffix='.png', dir=dirn)
+        os.close(fd)
+        try:
+            plt.savefig(tmp_path, dpi=150)
+            plt.close(fig)
+            # replace target
+            os.replace(tmp_path, outpath)
+        finally:
+            # ensure no temp file remains
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        plt.close(fig)
+        # Do not write the output file on failure
+        raise RuntimeError(f'Failed to generate plot: {e}')
+
     return outpath
 
 
@@ -380,6 +445,10 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser(description='Parse logs and run detections')
         parser.add_argument('--num_packets', type=int, default=100, help='Number of packets to simulate if no log exists')
         parser.add_argument('--mode', choices=['rule', 'ml', 'both'], default='both', help='Detection mode to run')
+        parser.add_argument('--payload_threshold', type=int, default=1000, help='Payload size (bytes) threshold for rule detection')
+        parser.add_argument('--port_threshold', type=int, default=1024, help='Port threshold for rule detection (ports < this are considered low)')
+        parser.add_argument('--rate_threshold', type=int, default=50, help='Packet-rate (per minute) threshold for rule detection')
+        parser.add_argument('--ml_contamination', default='auto', help='IsolationForest contamination parameter (float or "auto")')
         args = parser.parse_args(argv)
 
         # If logs missing, try to simulate
@@ -403,10 +472,17 @@ if __name__ == '__main__':
 
         # Run detections based on mode
         if args.mode in ('rule', 'both'):
-            df = detect_anomalies(df)
+            df = detect_anomalies(df, payload_threshold=args.payload_threshold, port_threshold=args.port_threshold, rate_threshold=args.rate_threshold)
         if args.mode in ('ml', 'both'):
             try:
-                df = ml_isolation_forest(df)
+                # convert ml_contamination to float when possible
+                contamination = args.ml_contamination
+                try:
+                    if contamination != 'auto':
+                        contamination = float(contamination)
+                except Exception:
+                    pass
+                df = ml_isolation_forest(df, contamination=contamination)
             except Exception as e:
                 print(f"ML detection failed: {e}")
 

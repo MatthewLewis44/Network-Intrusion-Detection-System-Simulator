@@ -14,11 +14,20 @@ The app uses functions from `parse_logs.py` to parse logs and run detections.
 """
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 from typing import List, Dict
 import os
+import time
+from pathlib import Path
+
+# For plotting
+try:
+    from parse_logs import plot_anomalies
+except Exception:
+    plot_anomalies = None
 
 # Import parser and detection helpers from project
 try:
@@ -45,17 +54,51 @@ app.add_middleware(
 
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), 'templates'))
 
+# Simple in-memory cache for parsed DataFrame
+# cache = { 'df': DataFrame, 'mtime': float, 'ts': float }
+cache = {'df': None, 'mtime': None, 'ts': 0}
+CACHE_TTL = 10.0  # seconds
+
+# Ensure static directory exists and mount it
+static_dir = os.path.join(os.path.dirname(__file__), 'static')
+os.makedirs(static_dir, exist_ok=True)
+app.mount('/static', StaticFiles(directory=static_dir), name='static')
+
 
 def _ensure_parser_available():
     if _import_error is not None or parse_network_logs is None:
         raise HTTPException(status_code=500, detail=f"Parser functions not available: {_import_error}")
 
 
+def _load_cached_df(filepath: str = 'network_logs.csv'):
+    """Load parsed DataFrame with a simple file-mtime-based cache.
+
+    Returns cached DataFrame when file hasn't changed and TTL not expired.
+    """
+    _ensure_parser_available()
+    try:
+        mtime = os.path.getmtime(filepath)
+    except Exception:
+        mtime = None
+
+    now = time.time()
+    # Use cache when mtime identical and within TTL
+    if cache['df'] is not None and cache['mtime'] == mtime and (now - cache['ts']) < CACHE_TTL:
+        return cache['df']
+
+    df = parse_network_logs(filepath)
+    if df is not None:
+        cache['df'] = df
+        cache['mtime'] = mtime
+        cache['ts'] = now
+    return df
+
+
 @app.get('/logs')
 def get_logs():
     """Return parsed logs as JSON list of records."""
     _ensure_parser_available()
-    df = parse_network_logs()
+    df = _load_cached_df()
     if df is None:
         raise HTTPException(status_code=500, detail="Failed to parse network logs")
     # Convert timestamps to ISO strings for JSON
@@ -99,7 +142,7 @@ def _build_alerts_list(df) -> List[Dict]:
 def get_alerts():
     """Return a JSON list of detected anomalies (rule-based and ML)."""
     _ensure_parser_available()
-    df = parse_network_logs()
+    df = _load_cached_df()
     if df is None:
         raise HTTPException(status_code=500, detail='Failed to parse network logs')
     df = detect_anomalies(df)
@@ -118,7 +161,7 @@ def get_alerts():
 def dashboard(request: Request):
     """Render a simple dashboard page showing recent alerts."""
     _ensure_parser_available()
-    df = parse_network_logs()
+    df = _load_cached_df()
     if df is None:
         return HTMLResponse(content="<h3>Error: Could not parse logs</h3>", status_code=500)
     df = detect_anomalies(df)
@@ -129,7 +172,80 @@ def dashboard(request: Request):
     alerts = _build_alerts_list(df)
     # Pass the most recent 100 alerts to the template
     recent = list(reversed(alerts))[:100]
+    # Ensure the anomalies plot exists on first dashboard load (or if missing)
+    try:
+        outpath = os.path.join(os.path.dirname(__file__), 'static', 'anomalies.png')
+        if plot_anomalies is not None and not os.path.exists(outpath):
+            try:
+                plot_anomalies(df, outpath)
+            except Exception:
+                # Do not block rendering if plotting fails; dashboard will show without image
+                pass
+    except Exception:
+        # ignore any unexpected errors ensuring dashboard still renders
+        pass
     return templates.TemplateResponse('dashboard.html', {"request": request, "alerts": recent})
+
+
+@app.get('/anomalies.png')
+def anomalies_png():
+    """Generate (or re-use) plot image and return as PNG file response."""
+    _ensure_parser_available()
+    df = _load_cached_df()
+    if df is None:
+        raise HTTPException(status_code=500, detail='Failed to parse network logs')
+
+    # Ensure detections are present
+    df = detect_anomalies(df)
+    try:
+        df = ml_isolation_forest(df)
+    except Exception:
+        pass
+
+    if plot_anomalies is None:
+        raise HTTPException(status_code=500, detail='Plotting function not available')
+
+    outpath = os.path.join(os.path.dirname(__file__), 'anomalies.png')
+    try:
+        plot_anomalies(df, outpath)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed to create plot: {e}')
+
+    return FileResponse(outpath, media_type='image/png')
+
+
+@app.get('/generate-plot')
+def generate_plot():
+    """Generate the anomalies plot into `static/anomalies.png` and return a JSON message.
+
+    Returns 404 if logs are missing or 500 on plotting errors.
+    """
+    _ensure_parser_available()
+    # Load parsed dataframe (may return None if logs missing)
+    df = _load_cached_df()
+    if df is None:
+        raise HTTPException(status_code=404, detail='network_logs.csv not found')
+
+    # Ensure detections exist
+    df = detect_anomalies(df)
+    try:
+        df = ml_isolation_forest(df)
+    except Exception:
+        pass
+
+    if plot_anomalies is None:
+        raise HTTPException(status_code=500, detail='Plotting function not available (matplotlib missing)')
+
+    outpath = os.path.join(static_dir, 'anomalies.png')
+    try:
+        plot_anomalies(df, outpath)
+    except FileNotFoundError:
+        # Underlying code may raise this if logs missing
+        raise HTTPException(status_code=404, detail='network_logs.csv not found')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Plot generation failed: {e}')
+
+    return JSONResponse({'message': 'Plot generated', 'path': '/static/anomalies.png'})
 
 
 if __name__ == '__main__':
