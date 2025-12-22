@@ -330,21 +330,3 @@ curl http://127.0.0.1:8000/dashboard
 ```
 
 ---
-
-### Key Design Decisions
-
-1. **Lazy parse_logs import** — Avoids running expensive detection/ML code at server startup.
-2. **Safe Matplotlib plotting** — Uses `Agg` backend (non-interactive), atomic file writes, placeholder fallback.
-3. **Static file mounting** — Serves generated PNGs without custom routes; reduces server overhead.
-4. **Rule-based + ML detection** — Combines threshold checks (fast) with IsolationForest (catches complex patterns).
-5. **CLI + Web hybrid** — Run locally via `parse_logs.py --mode both` or expose via `/alerts` and `/dashboard`.
-6. **Minimal dependencies** — FastAPI (async), pandas (data), scikit-learn (ML), Matplotlib (plotting).
-
----
-
-**Project is production-ready** for:
-- ✅ Local packet analysis and anomaly detection
-- ✅ Web dashboard for live monitoring
-- ✅ Docker deployment at scale
-- ✅ CI/CD testing via GitHub Actions
-- ✅ REST API for integration with SIEM or alerting systems
